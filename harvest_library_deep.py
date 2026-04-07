@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import shlex
+import subprocess
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR / "src"))
@@ -41,6 +46,7 @@ IGNORE_VIEW_PREFIXES = (
     "constraint",
     "ideal",
 )
+REMOTE_MAX_FILES = 4
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,6 +96,75 @@ def parse_inventory(raw: str) -> dict[str, list[str]]:
 def split_skill_list(raw: str) -> list[str]:
     values = [item.strip() for item in raw.split("||") if item.strip()]
     return [item for item in values if item.lower() != "nil"]
+
+
+def _clean_text(value: str) -> str:
+    return value.strip().strip('"').strip()
+
+
+def remote_run(command: str) -> str:
+    remote_user = os.getenv("VB_REMOTE_USER") or os.getenv("VB_USER")
+    remote_host = os.getenv("VB_REMOTE_HOST") or os.getenv("VB_HOST")
+    jump_host = os.getenv("VB_JUMP_HOST")
+    if not remote_user or not remote_host:
+        return ""
+
+    cmd = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=30",
+    ]
+    if jump_host:
+        cmd += ["-J", f"{remote_user}@{jump_host}"]
+    cmd += [f"{remote_user}@{remote_host}", f"sh -lc {shlex.quote(command)}"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def remote_find(base: str, patterns: list[str], *, maxdepth: int = 6, kind: str | None = None, limit: int = 20) -> list[str]:
+    if not base:
+        return []
+    type_clause = f"-type {kind}" if kind else ""
+    results: list[str] = []
+    for pattern in patterns:
+        command = (
+            f"if [ -e {shlex.quote(base)} ]; then "
+            f"find {shlex.quote(base)} -maxdepth {maxdepth} {type_clause} -name {shlex.quote(pattern)}; "
+            "fi"
+        )
+        for line in remote_run(command).splitlines():
+            line = line.strip()
+            if line:
+                results.append(line)
+    return sorted(set(results))[-limit:]
+
+
+def remote_read_text(path: str, *, max_lines: int = 200) -> str:
+    if not path:
+        return ""
+    return remote_run(f"sed -n '1,{max_lines}p' {shlex.quote(path)}")
+
+
+def remote_sqlite_rows(db_path: str, query: str) -> list[list[str]]:
+    normalized_query = " ".join(query.split())
+    quoted_query = normalized_query.replace('"', '""')
+    command = (
+        f"if [ -f {shlex.quote(db_path)} ]; then "
+        f"sqlite3 -separator '|' {shlex.quote(db_path)} \"{quoted_query}\"; "
+        "fi"
+    )
+    rows = []
+    for line in remote_run(command).splitlines():
+        if not line.strip():
+            continue
+        rows.append([cell.strip() for cell in line.split("|")])
+    return rows
 
 
 def first_schematic_view(views: list[str]) -> str | None:
@@ -285,6 +360,227 @@ def probe_library_root(client: VirtuosoClient, lib: str) -> str:
     return "nil"
 
 
+def parse_log_text(text: str) -> dict[str, object]:
+    specs: list[dict[str, str]] = []
+    params: dict[str, str] = {}
+    run_info: dict[str, str] = {}
+    current_corner = ""
+    section = ""
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("Design specs:"):
+            section = "specs"
+            continue
+        if line.startswith("Design parameters:"):
+            section = "params"
+            continue
+        if line.startswith("Current time:"):
+            run_info.setdefault("current_time", line.split(":", 1)[1].strip())
+            continue
+        if line.startswith("Best design point:"):
+            run_info["best_design_point"] = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("Number of points completed:"):
+            run_info["points_completed"] = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("Number of simulation errors:"):
+            run_info["simulation_errors"] = line.split(":", 1)[1].strip()
+            continue
+
+        if section == "specs":
+            if "corner" in line and "-" in line:
+                current_corner = line
+                continue
+            parts = re.split(r"\s{2,}|\t+", line)
+            parts = [p for p in parts if p]
+            if len(parts) >= 2:
+                specs.append({"context": current_corner, "name": parts[0], "value": parts[-1]})
+        elif section == "params":
+            parts = re.split(r"\s{2,}|\t+", line)
+            parts = [p for p in parts if p]
+            if len(parts) >= 2:
+                params[parts[0]] = parts[-1]
+
+    return {"run_info": run_info, "specs": specs[:40], "parameters": params}
+
+
+def parse_state_xml(text: str) -> dict[str, object]:
+    if not text:
+        return {}
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return {"raw_preview": text[:1000]}
+
+    data: dict[str, object] = {}
+    project_dir = root.find('.//field[@Name="projectDir"]')
+    if project_dir is not None and project_dir.text:
+        data["project_dir"] = _clean_text(project_dir.text)
+
+    design_info = root.find('.//field[@Name="designInfo"]')
+    if design_info is not None and design_info.text:
+        data["design_info"] = _clean_text(design_info.text)
+
+    analyses: dict[str, dict[str, str]] = {}
+    interesting = {
+        "stop",
+        "start",
+        "step",
+        "save",
+        "strobeperiod",
+        "write",
+        "writefinal",
+        "compression",
+        "errpreset",
+        "maxiters",
+        "finalTimeOP",
+        "saveOption",
+    }
+    for analysis in root.findall(".//analysis"):
+        aname = analysis.attrib.get("Name")
+        if not aname:
+            continue
+        opts: dict[str, str] = {}
+        for field in analysis.findall('./partition[@Name="options"]/field'):
+            name = field.attrib.get("Name", "")
+            value = _clean_text("".join(field.itertext()))
+            if not value or value in ("nil", '""'):
+                continue
+            if name in interesting or len(opts) < 12:
+                opts[name] = value
+        if opts:
+            analyses[aname] = opts
+    if analyses:
+        data["analyses"] = analyses
+    return data
+
+
+def probe_rdb(rdb_path: str) -> dict[str, object]:
+    outputs = remote_sqlite_rows(
+        rdb_path,
+        "select resultID,name,type,expression from result order by resultID limit 50;",
+    )
+    metrics = remote_sqlite_rows(
+        rdb_path,
+        """
+select r.name, count(*), min(CAST(rv.value AS REAL)), max(CAST(rv.value AS REAL))
+from resultValue rv
+join result r on rv.resultID=r.resultID
+where r.type=0
+group by r.resultID
+order by r.resultID
+limit 50;
+""".strip(),
+    )
+    metric_samples = remote_sqlite_rows(
+        rdb_path,
+        """
+select p.designPointNumber, r.name, rv.value
+from resultValue rv
+join point p on rv.pointID=p.pointID
+join result r on rv.resultID=r.resultID
+where r.type=0
+order by p.designPointNumber, r.resultID
+limit 80;
+""".strip(),
+    )
+    waveforms = remote_sqlite_rows(
+        rdb_path,
+        "select name, expression from result where type=1 order by resultID limit 50;",
+    )
+    parameters = remote_sqlite_rows(
+        rdb_path,
+        "select name, defaultValue, expression from parameter order by parameterID limit 50;",
+    )
+    corners = remote_sqlite_rows(
+        rdb_path,
+        "select name from corner order by cornerID limit 20;",
+    )
+    return {
+        "path": rdb_path,
+        "outputs": [
+            {"result_id": row[0], "name": row[1], "type": row[2], "expression": row[3] if len(row) > 3 else ""}
+            for row in outputs
+            if len(row) >= 3
+        ],
+        "metric_summary": [
+            {"name": row[0], "samples": row[1], "min": row[2], "max": row[3]}
+            for row in metrics
+            if len(row) >= 4
+        ],
+        "metric_samples": [
+            {"design_point": row[0], "name": row[1], "value": row[2]}
+            for row in metric_samples
+            if len(row) >= 3
+        ],
+        "waveform_outputs": [
+            {"name": row[0], "expression": row[1] if len(row) > 1 else ""}
+            for row in waveforms
+            if row
+        ],
+        "parameters": [
+            {"name": row[0], "default": row[1] if len(row) > 1 else "", "expression": row[2] if len(row) > 2 else ""}
+            for row in parameters
+            if row
+        ],
+        "corners": [row[0] for row in corners if row],
+    }
+
+
+def probe_project_dir(project_dir: str) -> dict[str, object]:
+    if not project_dir:
+        return {}
+    files = remote_find(
+        project_dir,
+        ["spectre.out", "spectre.inp", "artSimEnvLog", "si.foregnd.log", "designInfo", "*.scs"],
+        maxdepth=10,
+        kind="f",
+        limit=40,
+    )
+    psf_dirs = remote_find(project_dir, ["psf"], maxdepth=10, kind="d", limit=20)
+    previews = []
+    for path in files[:6]:
+        if path.endswith(("spectre.inp", "si.foregnd.log", "designInfo")):
+            previews.append({"path": path, "preview": remote_read_text(path, max_lines=40)})
+    return {"files": files, "psf_dirs": psf_dirs, "previews": previews}
+
+
+def probe_runtime_artifacts(lib_path: str, cell: str, view: str) -> dict[str, object]:
+    base = f"{lib_path}/{cell}/{view}"
+    state_files = remote_find(f"{base}/test_states", ["*.state"], maxdepth=6, kind="f", limit=REMOTE_MAX_FILES)
+    log_files = remote_find(f"{base}/results", ["*.log"], maxdepth=6, kind="f", limit=REMOTE_MAX_FILES)
+    rdb_files = remote_find(f"{base}/results", ["*.rdb"], maxdepth=6, kind="f", limit=REMOTE_MAX_FILES)
+
+    parsed_states = []
+    project_dirs = []
+    for path in state_files:
+        parsed = parse_state_xml(remote_read_text(path, max_lines=600))
+        parsed["path"] = path
+        parsed_states.append(parsed)
+        project_dir = parsed.get("project_dir")
+        if isinstance(project_dir, str) and project_dir:
+            project_dirs.append(project_dir)
+
+    parsed_logs = []
+    for path in log_files:
+        parsed = parse_log_text(remote_read_text(path, max_lines=300))
+        parsed["path"] = path
+        parsed_logs.append(parsed)
+
+    parsed_rdbs = [probe_rdb(path) for path in rdb_files]
+    project_artifacts = [probe_project_dir(path) for path in project_dirs[:2]]
+
+    return {
+        "state_files": parsed_states,
+        "log_files": parsed_logs,
+        "rdb_files": parsed_rdbs,
+        "project_dirs": project_artifacts,
+    }
+
+
 def main() -> None:
     args = parse_args()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -373,6 +669,18 @@ def main() -> None:
                 time.sleep(args.delay)
             result_paths["cells"][cell] = cell_paths
     save_json(out_dir, "06_result_paths", result_paths)
+
+    print("\n=== Step 7: runtime artifact parse ===")
+    runtime_data: dict[str, dict[str, object]] = {}
+    if lib_path and lib_path != "nil":
+        for cell in tb_cells:
+            entry: dict[str, object] = {}
+            for view in simulation_views[cell]["session_views"][:4]:
+                print(f"  {cell} :: {view} runtime")
+                entry[view] = probe_runtime_artifacts(lib_path, cell, view)
+                time.sleep(args.delay)
+            runtime_data[cell] = entry
+    save_json(out_dir, "07_runtime_artifacts", runtime_data)
 
     summary = {
         "library": args.lib,
