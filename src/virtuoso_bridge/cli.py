@@ -139,6 +139,146 @@ def _format_ssh_failure(ssh_env) -> None:
     print(f"  For a local VM, use the VM's IP (run `ip addr` inside the VM).")
 
 
+def _daemon_responds(port: int, *, timeout: int = 5) -> bool:
+    """Return True when the local tunnel endpoint answers a SKILL ping."""
+    from virtuoso_bridge.virtuoso.basic.bridge import VirtuosoClient
+
+    try:
+        return VirtuosoClient(host="127.0.0.1", port=port, timeout=timeout).test_connection(timeout=timeout)
+    except Exception:
+        return False
+
+
+def _managed_virtuoso_paths(setup_path: str, profile: str | None) -> dict[str, str]:
+    """Paths used by the bridge-managed headless Virtuoso launcher."""
+    tag = profile or "default"
+    setup = Path(setup_path)
+    root = str(setup.parent).replace("\\", "/")
+    return {
+        "root": root,
+        "launch": f"{root}/virtuoso_headless_{tag}.csh",
+        "log": f"{root}/virtuoso_headless_{tag}.log",
+        "out": f"{root}/virtuoso_headless_{tag}.out",
+    }
+
+
+def _bootstrap_daemon_if_needed(ssh, profile: str | None, *, is_local: bool) -> None:
+    """Start a bridge-managed headless Virtuoso session if no daemon answers."""
+    if is_local:
+        return
+    if _daemon_responds(ssh.port, timeout=5):
+        return
+
+    state = ssh.read_state(profile)
+    setup_path = str((state or {}).get("setup_path") or "")
+    if not setup_path:
+        return
+
+    runner = ssh.ssh_runner
+    if runner is None:
+        return
+
+    suffix = f"_{profile}" if profile else ""
+    cadence_cshrc = (
+        os.getenv(f"VB_CADENCE_CSHRC{suffix}", "").strip()
+        or os.getenv("VB_CADENCE_CSHRC", "").strip()
+    )
+    paths = _managed_virtuoso_paths(setup_path, profile)
+    remote_port = ssh.remote_port
+    launch_q = shlex.quote(paths["launch"])
+    log_q = shlex.quote(paths["log"])
+    out_q = shlex.quote(paths["out"])
+    root_q = shlex.quote(paths["root"])
+    cshrc_line = ""
+    if cadence_cshrc:
+        cshrc_line = f"if ( -f {shlex.quote(cadence_cshrc)} ) source {shlex.quote(cadence_cshrc)}\n"
+
+    script = (
+        "setenv HOSTNAME `hostname`\n"
+        "setenv LD_LIBRARY_PATH blank\n"
+        f"{cshrc_line}"
+        f"( /usr/bin/printf \"%s\\n\" 'load(\"{setup_path}\")' ; tail -f /dev/null ) "
+        f"| virtuoso -nograph -log {paths['log']}\n"
+    )
+    payload_token = f"__VB_HEADLESS_{int(time.time() * 1000)}__"
+    remote_cmd = f"""
+set -eu
+mkdir -p {root_q}
+cat > {launch_q} <<'{payload_token}'
+{script}{payload_token}
+chmod 755 {launch_q}
+rm -f {log_q} {out_q}
+nohup csh -f {launch_q} > {out_q} 2>&1 &
+echo $!
+"""
+    result = runner.run_command(remote_cmd, timeout=30)
+    if result.returncode != 0:
+        print(f"[warning] Failed to auto-start Virtuoso daemon: {result.stderr.strip()}")
+        print(f"  Fallback: load(\"{setup_path}\") in CIW")
+        return
+
+    launcher_pid = (result.stdout or "").strip().splitlines()[-1] if result.stdout.strip() else ""
+    ssh.update_state(
+        profile,
+        virtuoso_autostart=True,
+        virtuoso_launcher_pid=int(launcher_pid) if launcher_pid.isdigit() else None,
+        virtuoso_remote_port=remote_port,
+        virtuoso_launch_script=paths["launch"],
+        virtuoso_log=paths["log"],
+        virtuoso_stdout=paths["out"],
+    )
+
+    for _ in range(30):
+        if _daemon_responds(ssh.port, timeout=3):
+            print("daemon.bootstrap = OK")
+            return
+        time.sleep(1.0)
+
+    print("[warning] Virtuoso daemon did not respond after auto-start.")
+    print(f"  Log: {paths['log']}")
+    print(f"  Fallback: load(\"{setup_path}\") in CIW")
+
+
+def _stop_managed_virtuoso(profile: str | None, state: dict[str, object] | None) -> None:
+    """Stop a headless Virtuoso session previously started by the bridge."""
+    if not state or not state.get("virtuoso_autostart"):
+        return
+    from virtuoso_bridge.transport.tunnel import SSHClient, _is_localhost
+
+    remote_host = str(state.get("remote_host") or "")
+    if not remote_host or _is_localhost(remote_host):
+        return
+    try:
+        ssh = SSHClient.from_env(keep_remote_files=True, profile=profile)
+    except Exception:
+        return
+    try:
+        runner = ssh.ssh_runner
+        if runner is None:
+            return
+        patterns: list[str] = []
+        for key in ("virtuoso_launch_script", "virtuoso_log", "virtuoso_stdout"):
+            value = str(state.get(key) or "")
+            if value:
+                patterns.append(re.escape(value))
+        remote_port = state.get("virtuoso_remote_port")
+        if remote_port:
+            patterns.append(rf"ramic_bridge_daemon_[23]\.py .* {int(remote_port)}")
+        if not patterns:
+            return
+        pattern = "|".join(patterns)
+        cmd = f"""
+set +e
+pids=$(pgrep -u "$(id -un)" -f {shlex.quote(pattern)} 2>/dev/null)
+if [ -n "$pids" ]; then echo "$pids" | xargs -r kill; sleep 1; fi
+pids=$(pgrep -u "$(id -un)" -f {shlex.quote(pattern)} 2>/dev/null)
+if [ -n "$pids" ]; then echo "$pids" | xargs -r kill -9; fi
+"""
+        runner.run_command(cmd, timeout=20)
+    finally:
+        ssh.close()
+
+
 def _start_one_profile(profile: str | None) -> int:
     """Start tunnel for a single profile (thread-safe, uses explicit profile)."""
     suffix = f"_{profile}" if profile else ""
@@ -210,6 +350,7 @@ def _start_one_profile(profile: str | None) -> int:
             print(f"  {manual_cmd}")
             return 1
 
+        _bootstrap_daemon_if_needed(ssh, profile, is_local=is_local)
         return 0
     finally:
         ssh.close()
@@ -240,10 +381,12 @@ def _stop_one() -> int:
     from virtuoso_bridge.transport.tunnel import SSHClient
 
     label = f" [{profile}]" if profile else ""
-    if not SSHClient.is_running(profile):
+    state = SSHClient.read_state(profile)
+    if not SSHClient.is_running(profile) and not (state and state.get("virtuoso_autostart")):
         print(f"No tunnel running{label}.")
         return 0
 
+    _stop_managed_virtuoso(profile, state)
     ssh = SSHClient.from_env(keep_remote_files=True, profile=profile)
     ssh.stop()
     print(f"Tunnel stopped{label}.")

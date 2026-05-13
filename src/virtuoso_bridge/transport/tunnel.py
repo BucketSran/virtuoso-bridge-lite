@@ -224,6 +224,11 @@ class SSHClient:
         return self._local_port
 
     @property
+    def remote_port(self) -> int:
+        """Port where the RAMIC daemon listens on the remote host."""
+        return self._port
+
+    @property
     def remote_host(self) -> str:
         return self._remote_host
 
@@ -535,6 +540,15 @@ class SSHClient:
             return json.loads(sf.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def update_state(profile: str | None = None, **updates: Any) -> None:
+        """Merge additional lifecycle fields into the saved state."""
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        state = SSHClient.read_state(profile) or {}
+        state.update(updates)
+        state["updated_at"] = time.time()
+        _state_file(profile).write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     @classmethod
     def is_running(cls, profile: str | None = None) -> bool:

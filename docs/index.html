@@ -159,16 +159,15 @@
 <span class="cmt"># VB_REMOTE_PORT=65081     # auto-assigned by hashing VB_REMOTE_USER</span>
 <span class="cmt"># VB_LOCAL_PORT=65082</span>
 
-<span class="cmt"># 4. Start the bridge</span>
+<span class="cmt"># 4. Start the bridge (tunnel + daemon bootstrap)</span>
 <span class="cmd">virtuoso-bridge start</span>
 
-<span class="cmt"># 5. Load SKILL in Virtuoso CIW (path printed by `virtuoso-bridge start`)</span>
-<span class="cmt"># load("/tmp/virtuoso_bridge_&lt;user&gt;/virtuoso_bridge/virtuoso_setup.il")</span>
-
-<span class="cmt"># 6. Verify</span>
+<span class="cmt"># 5. Verify</span>
 <span class="cmd">virtuoso-bridge status</span></code></pre>
 
-    <pre><code><span class="cmt"># 7. Connect from Python</span>
+    <p style="color:var(--muted);font-size:0.9rem">Manual <code>load("/tmp/virtuoso_bridge_&lt;user&gt;/virtuoso_bridge/virtuoso_setup.il")</code> in CIW is a fallback for diagnosing <code>[daemon] NO RESPONSE</code>, not the normal setup flow.</p>
+
+    <pre><code><span class="cmt"># 6. Connect from Python</span>
 <span class="kw">from</span> virtuoso_bridge <span class="kw">import</span> VirtuosoClient
 
 client = VirtuosoClient.<span class="fn">from_env</span>()
@@ -196,7 +195,7 @@ VB_REMOTE_USER_worker1=user2</code></pre>
 
 bridge = VirtuosoClient.<span class="fn">local</span>(port=65432)
 bridge.<span class="fn">execute_skill</span>(<span class="str">"1+2"</span>)</code></pre>
-    <p style="color:var(--muted);font-size:0.9rem">Set <code>VB_REMOTE_HOST=localhost</code> and run <code>virtuoso-bridge start</code> — it skips the SSH tunnel, deploys the bridge files locally, and prints the <code>load(...)</code> line for the CIW.</p>
+    <p style="color:var(--muted);font-size:0.9rem">Set <code>VB_REMOTE_HOST=localhost</code> and run <code>virtuoso-bridge start</code> — it skips the SSH tunnel and bootstraps the local bridge. A printed <code>load(...)</code> line is a fallback hint if daemon startup fails.</p>
   </div>
 
   <!-- API Reference -->
@@ -325,7 +324,7 @@ bridge = VirtuosoClient.<span class="fn">local</span>(port=65432)</code></pre>
       <table>
         <tr><th>Command</th><th>Description</th></tr>
         <tr><td><code>virtuoso-bridge init [user@host] [-J user@jump] [--force]</code></td><td>Write <code>~/.virtuoso-bridge/.env</code>; arguments fill host/user/jump, <code>--force</code> overwrites an existing file</td></tr>
-        <tr><td><code>virtuoso-bridge start</code></td><td>Start SSH tunnel + deploy daemon</td></tr>
+        <tr><td><code>virtuoso-bridge start</code></td><td>Start SSH tunnel + bootstrap daemon</td></tr>
         <tr><td><code>virtuoso-bridge status</code></td><td>Check tunnel, daemon, hostname, Spectre license</td></tr>
         <tr><td><code>virtuoso-bridge restart</code></td><td>Restart tunnel</td></tr>
         <tr><td><code>virtuoso-bridge stop</code></td><td>Stop tunnel</td></tr>

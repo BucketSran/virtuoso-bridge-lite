@@ -68,8 +68,8 @@ All `virtuoso-bridge` CLI commands and Python scripts must run inside the activa
 ### Connection sequence (follow in order)
 
 1. **Check `.env`** — the bridge looks up `.env` in this order: `--env FILE` (CLI flag) → `./.env` (project-local) → `~/.virtuoso-bridge/.env` (user-level). If **any** of these exists, skip `init`. Only run **`virtuoso-bridge init`** when none exist — it creates `~/.virtuoso-bridge/.env` (user-level, shared across projects). If the user already told you their SSH target, prefer `virtuoso-bridge init user@host [-J user@jump]` to fill host/user/jump + port in one step; otherwise plain `virtuoso-bridge init` writes an empty template for them to edit.
-2. **`virtuoso-bridge start`** — starts the local bridge service and SSH tunnel.
-3. **If status is `degraded`** — the user must load the setup script in Virtuoso CIW (the `start` output tells them exactly what to run).
+2. **`virtuoso-bridge start`** — starts the SSH tunnel and bootstraps the bridge daemon.
+3. **If status reports `[daemon] NO RESPONSE`** — treat the printed setup script as a fallback/debug hint; do not make the user load it in CIW as the normal workflow.
 4. **`virtuoso-bridge status`** — verify everything is `healthy` before proceeding.
 5. **`virtuoso-bridge windows`** — list all open Virtuoso windows (num + name).
 6. **`virtuoso-bridge screenshot [ciw|current|N]`** — screenshot a window to `output/`. Default: CIW.

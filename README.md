@@ -100,8 +100,8 @@ The divergence is in what's built on top: skillbridge stays thin — a Pythonic 
 pip install -e .              # install
 virtuoso-bridge init user@host [-J user@jump-host]   # write ~/.virtuoso-bridge/.env in one shot
                                                      # (no args: empty template — edit it yourself)
-virtuoso-bridge start         # start SSH tunnel
-virtuoso-bridge status        # verify connection
+virtuoso-bridge start         # start SSH tunnel + bridge bootstrap
+virtuoso-bridge status        # verify tunnel, Virtuoso daemon, and Spectre
 virtuoso-bridge windows       # list all open Virtuoso windows
 virtuoso-bridge screenshot    # screenshot CIW (or: current, N)
 virtuoso-bridge export-visio MyLib MyCell -o MyCell.vsdx  # Windows + Visio
