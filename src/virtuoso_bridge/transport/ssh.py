@@ -274,11 +274,11 @@ class SSHRunner:
             remote_port = port
 
         cmd: list[str] = [self._ssh_cmd]
-        # Use ControlMaster options — if a master already exists, the slave
-        # will request port-forwarding from it and then exit.  The master
-        # keeps the forward alive.  If no master exists, this becomes the
-        # master (ControlMaster=auto).
-        cmd += self._common_ssh_options()
+        # A managed tunnel must be a standalone process so the bridge can
+        # record a stable PID.  If OpenSSH multiplexing takes over the
+        # forward, the launched ``ssh -N -L`` client may exit immediately and
+        # leave us with no process to track.
+        cmd += self._common_ssh_options(control_master=False)
         cmd += [
             "-o", "ExitOnForwardFailure=yes",
             "-N",
@@ -382,9 +382,10 @@ class SSHRunner:
                     err_msg = proc.stderr.read().decode("utf-8", errors="ignore")
                 except (OSError, ValueError):
                     pass
-            # Slave exited — check if ControlMaster took over the forward
+            # The process exited. If the port is still reachable, assume an
+            # already-running external tunnel won the race.
             if self.can_reach_port(port):
-                logger.info("Port forward active at localhost:%d (ControlMaster)", port)
+                logger.info("Port forward active at localhost:%d (external tunnel)", port)
                 self._tunnel_using_external = True
                 return None
             if "address already in use" in err_msg.lower():
@@ -1353,8 +1354,9 @@ class SSHRunner:
         self._shell_queue = None
         self._shell_reader = None
 
-    def _common_ssh_options(self) -> list[str]:
+    def _common_ssh_options(self, *, control_master: bool | None = None) -> list[str]:
         """SSH options shared by both ssh and scp commands."""
+        use_control_master = self._use_control_master if control_master is None else control_master
         opts: list[str] = [
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=no",
@@ -1372,11 +1374,16 @@ class SSHRunner:
             # risk of a slow reverse-DNS / IdentityFile probe).
             "-o", "HostbasedAuthentication=no",
         ]
-        if self._use_control_master:
+        if use_control_master:
             opts += [
                 "-o", "ControlMaster=auto",
                 "-o", f"ControlPath={self._control_path}",
                 "-o", "ControlPersist=3600",
+            ]
+        elif control_master is False:
+            opts += [
+                "-o", "ControlMaster=no",
+                "-o", "ControlPath=none",
             ]
         if self._ssh_config_path:
             opts += ["-F", str(self._ssh_config_path)]
